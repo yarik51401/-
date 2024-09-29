@@ -1,0 +1,526 @@
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+from datetime import datetime, timedelta, timezone
+import pytz
+import asyncio
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.guilds = True
+intents.guild_messages = True
+intents.guild_reactions = True
+intents.voice_states = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Словари для хранения информации о мьютах и банах
+muted_users = {}
+ban_data = {}
+warns = {}
+LOG_CHANNEL_ID = 1226432792355934249
+
+def format_time(timestamp: int) -> str:
+    tz = pytz.timezone('Europe/Moscow')
+    local_time = datetime.fromtimestamp(timestamp, tz)
+    return local_time.strftime("%d.%m.%Y %H:%M")
+
+def parse_duration(duration):
+    units = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
+    total_seconds = 0
+    duration = duration.lower()
+    num = ''
+
+    for char in duration:
+        if char.isdigit():
+            num += char
+        elif char in units:
+            if num:
+                total_seconds += int(num) * units[char]
+                num = ''
+        else:
+            raise ValueError("Неправильный формат продолжительности.")
+
+    if num:
+        total_seconds += int(num)
+
+    return total_seconds
+
+def create_embed(title, description, color=discord.Color.blurple(), user=None, channel=None, message_url=None, message_id=None):
+    embed = discord.Embed(title=title, description=description, color=color)
+    utc_time = datetime.now(timezone.utc)
+    tz = pytz.timezone('Europe/Moscow')
+    local_time = utc_time.astimezone(tz)
+    embed.set_footer(text=f"Время: {local_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    if user:
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.add_field(name="Автор", value=f"{user.mention} ({user})")
+    if message_url:
+        embed.add_field(name="Сообщение", value=f"[Перейти к сообщению]({message_url})")
+    if channel:
+        embed.add_field(name="Канал", value=f"{channel.name} ({channel.mention})")
+    if message_id:
+        embed.add_field(name="Id сообщения", value=message_id)
+    return embed
+
+async def send_log_message(embed):
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send(embed=embed)
+    else:
+        print(f"Канал с ID {LOG_CHANNEL_ID} не найден. Проверьте правильность ID и разрешения бота.")
+
+@bot.command()
+async def time(ctx, timestamp: int):
+    embed = discord.Embed(
+        title='Время',
+        description=f'Время, которое вы ввели: <t:{timestamp}:f>'
+    )
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def muterole(ctx):
+    muted_role = discord.utils.get(ctx.guild.roles, name='Muted')
+    if muted_role:
+        await ctx.send("Роль 'Muted' уже создана.")
+        return
+
+    try:
+        muted_role = await ctx.guild.create_role(name='Muted', reason="Роль для мьюта пользователей")
+        for channel in ctx.guild.channels:
+            await channel.set_permissions(muted_role, send_messages=False)
+        await ctx.send("Роль 'Muted' успешно создана и настроена.")
+    except discord.Forbidden:
+        await ctx.send("У бота нет разрешений на создание или настройку ролей.")
+    except discord.HTTPException as e:
+        await ctx.send(f"Произошла ошибка при создании роли: {e}")
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user.name} ({bot.user.id})')
+    check_mute_task.start()
+    check_ban_task.start()
+
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def mute(ctx, member: discord.Member = None, duration: str = None, *, reason=None):
+    if member is None or duration is None:
+        embed = discord.Embed(
+            title="Ошибка",
+            description=":x: Слишком мало аргументов.\n\nИспользование:\n!mute <участник> <продолжительность> [причина]",
+            color=discord.Color.red()
+        )
+        embed.set_author(name=f"{ctx.author.name}#{ctx.author.discriminator}", icon_url=ctx.author.avatar.url)
+        error_message = await ctx.send(embed=embed)
+        await error_message.add_reaction('❌')
+        await asyncio.sleep(10)
+        await error_message.delete()
+        return
+
+    muted_role = discord.utils.get(ctx.guild.roles, name='Muted')
+    if not muted_role:
+        await ctx.send("Роль 'Muted' не найдена. Пожалуйста, создайте её с помощью команды !muterole.")
+        return
+
+    try:
+        duration_seconds = parse_duration(duration)
+    except ValueError as e:
+        await ctx.send(f"Ошибка: {e}")
+        return
+
+    end_time = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+    end_timestamp = int(end_time.timestamp())
+
+    if member.id in muted_users:
+        current_end_time = muted_users[member.id]['end_time']
+
+        if current_end_time and current_end_time > datetime.now(timezone.utc):
+            if end_time > current_end_time:
+                muted_users[member.id]['end_time'] = end_time
+                end_timestamp = int(end_time.timestamp())
+                await ctx.send(
+                    f"{member.mention} уже замьючен(а) до <t:{int(current_end_time.timestamp())}:f>")
+            return
+        else:
+            muted_users[member.id]['end_time'] = end_time
+            end_timestamp = int(end_time.timestamp())
+    else:
+        muted_users[member.id] = {
+            'end_time': end_time,
+            'reason': reason,
+            'mod': ctx.author.id
+        }
+
+    await member.add_roles(muted_role, reason=reason)
+
+    member_avatar_url = member.avatar.url
+    server_icon_url = ctx.guild.icon.url
+
+    embed = discord.Embed(
+        title="Мьют",
+        description=(
+            f"{member.mention} был(а) замучен(а) на {duration}.\n"
+            f"Время окончания: <t:{end_timestamp}:f>.\n"
+            f"Причина: {reason if reason else 'Не указана'}.\n"
+            f"Модератор: {ctx.author.mention}"
+        ),
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_thumbnail(url=server_icon_url)
+    embed.set_author(name=f"{member.name}#{member.discriminator}", icon_url=member_avatar_url)
+    embed.set_footer(text=f"Сервер: {ctx.guild.name}")
+
+    # Отправляем сообщение о мьюте
+    success_message = await ctx.send(embed=embed)
+    await success_message.add_reaction('✅')
+
+    # Добавляем реакцию к сообщению участника, на которое была вызвана команда
+    try:
+        await ctx.message.add_reaction('✅')
+    except discord.Forbidden:
+        await ctx.send("Не удалось добавить реакцию к сообщению участника. Проверьте права бота.")
+
+    await asyncio.sleep(10)
+    await success_message.delete()
+
+    dm_embed = discord.Embed(
+        title="Вы были замучены",
+        description=(
+            f"Вы были замучены на {duration}.\n"
+            f"Время окончания: <t:{end_timestamp}:f>.\n"
+            f"Причина: {reason if reason else 'Не указана'}.\n"
+            f"Модератор: {ctx.author.mention}"
+        ),
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    dm_embed.set_thumbnail(url=server_icon_url)
+    dm_embed.set_author(name=f"{member.name}#{member.discriminator}", icon_url=member_avatar_url)
+    dm_embed.set_footer(text=f"Сервер: {ctx.guild.name}")
+
+    try:
+        await member.send(embed=dm_embed)
+    except discord.Forbidden:
+        await ctx.send(
+            f"Не удалось отправить личное сообщение {member.mention}. Убедитесь, что у бота есть права на отправку личных сообщений.")
+
+@bot.command(name='write')
+async def write(ctx, member: discord.Member, *, message: str):
+    try:
+        # Отправляем личное сообщение участнику
+        await member.send(message)
+        # Подтверждаем успешную отправку сообщения в канале
+        await ctx.send(f'Сообщение отправлено')
+    except discord.Forbidden:
+        # Обрабатываем случай, когда бот не может отправить сообщение
+        await ctx.send(f'Не удалось отправить сообщение {member.mention}. Возможно, бот не может отправлять личные сообщения этому пользователю.')
+
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def unmute(ctx, member: discord.Member = None):
+    if member is None:
+        embed = discord.Embed(
+            title="Ошибка",
+            description=":x: Укажите участника.\n\nИспользование:\n!unmute <участник>",
+            color=discord.Color.red()
+        )
+        embed.set_author(name=f"{ctx.author.name}#{ctx.author.discriminator}", icon_url=ctx.author.avatar.url)
+        error_message = await ctx.send(embed=embed)
+        await error_message.add_reaction('❌')
+        await asyncio.sleep(10)
+        await error_message.delete()
+        return
+
+    muted_role = discord.utils.get(ctx.guild.roles, name='Muted')
+    if not muted_role:
+        await ctx.send("Роль 'Muted' не найдена. Пожалуйста, создайте её с помощью команды !muterole.")
+        return
+
+    if member.id not in muted_users:
+        await ctx.send(f"{member.mention} не находится в списке замьюченных.")
+        return
+
+    current_end_time = muted_users[member.id]['end_time']
+
+    # Удаляем запись о мута, если время мута истекло
+    if current_end_time and current_end_time <= datetime.now(timezone.utc):
+        del muted_users[member.id]
+        await member.remove_roles(muted_role, reason="Автоматическое снятие мута после истечения времени")
+        await ctx.send(f"{member.mention} был(а) размутен(а), так как время мута истекло.")
+        return
+
+    # Снимаем мьют и удаляем запись о мута
+    del muted_users[member.id]
+    await member.remove_roles(muted_role, reason="Мьют снят модератором")
+
+    embed = discord.Embed(
+        title="Размут",
+        description=f"{member.mention} был(а) размутен(а).",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_author(name=f"{member.name}#{member.discriminator}", icon_url=member.avatar.url)
+    embed.set_footer(text=f"Сервер: {ctx.guild.name}")
+
+    success_message = await ctx.send(embed=embed)
+    await success_message.add_reaction('✅')
+
+    try:
+        await ctx.message.add_reaction('✅')
+    except discord.Forbidden:
+        await ctx.send("Не удалось добавить реакцию к сообщению участника. Проверьте права бота.")
+
+    await asyncio.sleep(10)
+    await success_message.delete()
+
+    dm_embed = discord.Embed(
+        title="Вы были размутены",
+        description="Вы были размутены.",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    dm_embed.set_author(name=f"{member.name}#{member.discriminator}", icon_url=member.avatar.url)
+    dm_embed.set_footer(text=f"Сервер: {ctx.guild.name}")
+
+    try:
+        await member.send(embed=dm_embed)
+    except discord.Forbidden:
+        await ctx.send(
+            f"Не удалось отправить личное сообщение {member.mention}. Убедитесь, что у бота есть права на отправку личных сообщений.")
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def warn(ctx, member: discord.Member = None, *, reason=None):
+    if member is None or reason is None:
+        embed = discord.Embed(
+            title="Ошибка",
+            description=":x: Слишком мало аргументов.\n\nИспользование:\n!warn <участник> [причина]",
+            color=discord.Color.red()
+        )
+        embed.set_author(name=f"{ctx.author.name}#{ctx.author.discriminator}", icon_url=ctx.author.avatar.url)
+        error_message = await ctx.send(embed=embed)
+        await error_message.add_reaction('❌')
+        await asyncio.sleep(10)
+        await error_message.delete()
+        return
+
+    if member.id not in warns:
+        warns[member.id] = []
+
+    warns[member.id].append({
+        'reason': reason,
+        'mod': ctx.author.id,
+        'timestamp': datetime.now(timezone.utc)
+    })
+
+    embed = discord.Embed(
+        title="Предупреждение",
+        description=(
+            f"{member.mention} был(а) предупрежден(а).\n"
+            f"Причина: {reason if reason else 'Не указана'}.\n"
+            f"Модератор: {ctx.author.mention}"
+        ),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_author(name=f"{member.name}#{member.discriminator}", icon_url=member.avatar.url)
+    embed.set_footer(text=f"Сервер: {ctx.guild.name}")
+
+    success_message = await ctx.send(embed=embed)
+    await success_message.add_reaction('✅')
+
+    try:
+        await ctx.message.add_reaction('✅')
+    except discord.Forbidden:
+        await ctx.send("Не удалось добавить реакцию к сообщению участника. Проверьте права бота.")
+
+    await asyncio.sleep(10)
+    await success_message.delete()
+
+    dm_embed = discord.Embed(
+        title="Вы получили предупреждение",
+        description=(
+            f"Вы получили предупреждение.\n"
+            f"Причина: {reason if reason else 'Не указана'}.\n"
+            f"Модератор: {ctx.author.mention}"
+        ),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    dm_embed.set_author(name=f"{member.name}#{member.discriminator}", icon_url=member.avatar.url)
+    dm_embed.set_footer(text=f"Сервер: {ctx.guild.name}")
+
+    try:
+        await member.send(embed=dm_embed)
+    except discord.Forbidden:
+        await ctx.send(
+            f"Не удалось отправить личное сообщение {member.mention}. Убедитесь, что у бота есть права на отправку личных сообщений.")
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def unwarn(ctx, member: discord.Member = None):
+    if member is None:
+        embed = discord.Embed(
+            title="Ошибка",
+            description=":x: Укажите участника.\n\nИспользование:\n!unwarn <участник>",
+            color=discord.Color.red()
+        )
+        embed.set_author(name=f"{ctx.author.name}#{ctx.author.discriminator}", icon_url=ctx.author.avatar.url)
+        error_message = await ctx.send(embed=embed)
+        await error_message.add_reaction('❌')
+        await asyncio.sleep(10)
+        await error_message.delete()
+        return
+
+    if member.id not in warns or not warns[member.id]:
+        await ctx.send(f"{member.mention} не имеет предупреждений.")
+        return
+
+    warns[member.id].pop()
+
+    embed = discord.Embed(
+        title="Предупреждение снято",
+        description=f"Последнее предупреждение для {member.mention} было удалено.",
+        color=discord.Color.green()
+    )
+    embed.set_author(name=f"{member.name}#{member.discriminator}", icon_url=member.avatar.url)
+    embed.set_footer(text=f"Сервер: {ctx.guild.name}")
+
+    success_message = await ctx.send(embed=embed)
+    await success_message.add_reaction('✅')
+
+    try:
+        await ctx.message.add_reaction('✅')
+    except discord.Forbidden:
+        await ctx.send("Не удалось добавить реакцию к сообщению участника. Проверьте права бота.")
+
+    await asyncio.sleep(10)
+    await success_message.delete()
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def warnings(ctx, member: discord.Member = None):
+    if member is None:
+        embed = discord.Embed(
+            title="Ошибка",
+            description=":x: Укажите участника.\n\nИспользование:\n!warnings <участник>",
+            color=discord.Color.red()
+        )
+        embed.set_author(name=f"{ctx.author.name}#{ctx.author.discriminator}", icon_url=ctx.author.avatar.url)
+        error_message = await ctx.send(embed=embed)
+        await error_message.add_reaction('❌')
+        await asyncio.sleep(10)
+        await error_message.delete()
+        return
+
+    if member.id not in warns or not warns[member.id]:
+        await ctx.send(f"{member.mention} не имеет предупреждений.")
+        return
+
+    embed = discord.Embed(
+        title="История предупреждений",
+        description=f"История предупреждений для {member.mention}:",
+        color=discord.Color.orange()
+    )
+
+    for warn in warns[member.id]:
+        mod = ctx.guild.get_member(warn['mod'])
+        timestamp = warn['timestamp'].strftime("%d.%m.%Y %H:%M")
+        embed.add_field(
+            name=f"Предупреждение от {mod.mention if mod else 'Неизвестный модератор'}",
+            value=f"Причина: {warn['reason']}\nДата: {timestamp}",
+            inline=False
+        )
+
+    embed.set_footer(text=f"Сервер: {ctx.guild.name}")
+
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def unban(ctx, user: discord.User):
+    try:
+        await ctx.guild.unban(user)
+        embed = discord.Embed(
+            title="Разбан",
+            description=f"{user.mention} был(а) разбанен(а).",
+            color=discord.Color.green()
+        )
+        embed.set_author(name=f"{user.name}#{user.discriminator}", icon_url=user.avatar.url)
+        embed.set_footer(text=f"Сервер: {ctx.guild.name} | Время: <t:{int(datetime.now().timestamp())}:f>")
+        success_message = await ctx.send(embed=embed)
+        await success_message.add_reaction('✅')
+
+        try:
+            await ctx.message.add_reaction('✅')
+        except discord.Forbidden:
+            await ctx.send("Не удалось добавить реакцию к сообщению участника. Проверьте права бота.")
+
+        await asyncio.sleep(10)
+        await success_message.delete()
+
+    except discord.NotFound:
+        await ctx.send("Этот пользователь не был забанен.")
+    except discord.Forbidden:
+        await ctx.send("У бота нет разрешений на разбан пользователей.")
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def ban(ctx, user: discord.User, *, reason=None):
+    try:
+        await ctx.guild.ban(user, reason=reason)
+        ban_data[user.id] = {
+            'reason': reason,
+            'mod': ctx.author.id
+        }
+
+        embed = discord.Embed(
+            title="Бан",
+            description=f"{user.mention} был(а) забанен(а) по причине: {reason if reason else 'Не указана'}.",
+            color=discord.Color.red()
+        )
+        embed.set_author(name=f"{user.name}#{user.discriminator}", icon_url=user.avatar.url)
+        embed.set_footer(text=f"Сервер: {ctx.guild.name} | Время: <t:{int(datetime.now().timestamp())}:f>")
+        success_message = await ctx.send(embed=embed)
+        await success_message.add_reaction('✅')
+
+        try:
+            await ctx.message.add_reaction('✅')
+        except discord.Forbidden:
+            await ctx.send("Не удалось добавить реакцию к сообщению участника. Проверьте права бота.")
+
+        await asyncio.sleep(10)
+        await success_message.delete()
+
+    except discord.Forbidden:
+        await ctx.send("У бота нет разрешений на бан пользователей.")
+    except discord.HTTPException as e:
+        await ctx.send(f"Произошла ошибка при бане пользователя: {e}")
+
+@tasks.loop(seconds=60)
+async def check_mute_task():
+    current_time = datetime.now(timezone.utc)
+    to_remove = [user_id for user_id, data in muted_users.items() if data['end_time'] and data['end_time'] <= current_time]
+
+    for user_id in to_remove:
+        guild = bot.get_guild(1225492400798044190)
+        member = guild.get_member(user_id)
+        muted_role = discord.utils.get(guild.roles, name='Muted')
+        if member and muted_role:
+            await member.remove_roles(muted_role)
+        if user_id in muted_users:
+            del muted_users[user_id]
+
+@tasks.loop(seconds=60)
+async def check_ban_task():
+    # Поскольку Discord API не предоставляет информации о сроке бана, бан данных не могут быть проверены
+    # и следовательно вам нужно будет управлять ими вручную. Этот код предназначен для демонстрации.
+    pass
+
+
+# Запуск бота
+bot.run('')
+
